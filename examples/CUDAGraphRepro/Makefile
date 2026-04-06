@@ -10,8 +10,8 @@ LIBS         := -L$(CUPTI_LIB) -lcuda -lcupti -lpthread -ldl
 
 CXXFLAGS_REL   := -O2 -DTRACY_ENABLE
 CXXFLAGS_DBG   := -g -O0 -DTRACY_ENABLE
-NVCCFLAGS_REL  := -O2 -DTRACY_ENABLE
-NVCCFLAGS_DBG  := -g -O0 -DTRACY_ENABLE
+NVCCFLAGS_REL  := -arch=native -O2 -DTRACY_ENABLE
+NVCCFLAGS_DBG  := -arch=native -g -O0 -DTRACY_ENABLE
 
 .PHONY: all debug clean
 
