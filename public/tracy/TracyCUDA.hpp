@@ -1110,13 +1110,13 @@ namespace tracy
             {
                 ZoneNamedN(kernel, "tracy::CUDACtx::DoProcessDeviceEvent[malloc/free]", instrument);
                 CUpti_ActivityMemory3* memory3 = (CUpti_ActivityMemory3*)record;
-                // Memory alloc/free records may not have a matching API call entry —
-                // e.g. allocations made before profiling started, or nodes inside a
-                // CUDA graph launch (CUpti_ActivityMemory3 has no graphId field).
-                // The handler only needs address, size, and timestamp from the activity
-                // record, so we proceed regardless of whether correlation succeeds.
-                APICallInfo apiCall;
-                matchActivityToAPICall(memory3->correlationId, apiCall);
+                // Do NOT call matchActivityToAPICall here. The handler only needs
+                // address, size, and timestamp — apiCall is never used. More importantly,
+                // consuming the cudaCallSiteInfo entry would break kernel/memcpy zone
+                // correlation for graphs that mix alloc nodes with other node types: all
+                // activities in one graph launch share the same correlationId, so consuming
+                // it here would prevent matchGraphActivityToAPICall from finding it for the
+                // subsequent kernel or memcpy records from the same launch.
                 static constexpr const char* graph_name = "CUDA Memory Allocation";
                 if (memory3->memoryOperationType == CUPTI_ACTIVITY_MEMORY_OPERATION_TYPE_ALLOCATION){
                     auto& memAllocAddress = PersistentState::Get().memAllocAddress;
