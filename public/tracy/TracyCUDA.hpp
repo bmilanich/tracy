@@ -660,15 +660,44 @@ namespace tracy
             FlushActivityAsync();
         }
 
+        // Returns the graphId field from activity record kinds that carry one,
+        // or 0 for records that are not graph-launched or don't have the field.
+        static uint32_t getGraphIdFromRecord(const CUpti_Activity* record) {
+            switch (record->kind) {
+                case CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL:
+                    return reinterpret_cast<const CUpti_ActivityKernel9*>(record)->graphId;
+                case CUPTI_ACTIVITY_KIND_MEMCPY:
+                    return reinterpret_cast<const CUpti_ActivityMemcpy5*>(record)->graphId;
+                case CUPTI_ACTIVITY_KIND_MEMSET:
+                    return reinterpret_cast<const CUpti_ActivityMemset4*>(record)->graphId;
+                default:
+                    return 0;
+            }
+        }
+
         static void CUPTIAPI OnBufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t* buffer, size_t size, size_t validSize)
         {
             // CUDA 6.0 onwards: all buffers from this callback are "global" buffers
             // (i.e. there is no context/stream specific buffer; ctx is always NULL)
             ZoneScoped;
             tracy::SetThreadName("NVIDIA CUPTI Worker");
+            // Check if any graph execs are pending retirement before entering
+            // the record loop — avoids the graphIdsSeenInBuffer heap allocation
+            // on the hot path when no execs have been destroyed.
+            bool trackRetirement;
+            {
+                auto& state = PersistentState::Get();
+                std::lock_guard<std::mutex> lock(state.graphRetireMutex);
+                trackRetirement = !state.graphExecPendingRetire.empty();
+            }
             CUptiResult status;
             CUpti_Activity* record = nullptr;
+            std::unordered_set<uint32_t> graphIdsSeenInBuffer;
             while ((status = cuptiActivityGetNextRecord(buffer, validSize, &record)) == CUPTI_SUCCESS) {
+                if (trackRetirement) {
+                    uint32_t gId = getGraphIdFromRecord(record);
+                    if (gId != 0) graphIdsSeenInBuffer.insert(gId);
+                }
                 DoProcessDeviceEvent(record);
             }
             if (status != CUPTI_ERROR_MAX_LIMIT_REACHED) {
@@ -678,6 +707,28 @@ namespace tracy
             CUPTI_API_CALL(cuptiActivityGetNumDroppedRecords(ctx, streamId, &dropped));
             assert(dropped == 0);
             tracyFree(buffer);
+
+            // Retire cudaGraphCurrentLaunch entries for destroyed exec handles.
+            // We defer erasure until a buffer arrives that contains no records
+            // from the exec: if the graphId still appears here, more records may
+            // be in flight. Once a full buffer passes with no records for that
+            // graphId, all in-flight activity for that exec has been delivered.
+            // Note: holds graphRetireMutex then acquires cudaGraphCurrentLaunch's
+            // internal shared_mutex — lock order is always outer→inner, no deadlock.
+            if (trackRetirement) {
+                auto& state = PersistentState::Get();
+                std::lock_guard<std::mutex> lock(state.graphRetireMutex);
+                for (auto it = state.graphExecPendingRetire.begin();
+                     it != state.graphExecPendingRetire.end(); ) {
+                    if (graphIdsSeenInBuffer.count(*it) == 0) {
+                        state.cudaGraphCurrentLaunch.erase(*it);
+                        it = state.graphExecPendingRetire.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+            }
+
             PersistentState::Get().profilerHost->OnEventsProcessed();
         }
 
@@ -872,6 +923,30 @@ namespace tracy
                 auto& entryFlags = *apiInfo->correlationData;
                 assert(entryFlags == 0);
                 entryFlags |= trackDeviceActivity ? 0x8000 : 0;
+
+                // On graph exec destruction, record the graphId for deferred
+                // retirement of its cudaGraphCurrentLaunch cache entry.
+                // cuptiGetGraphExecId must be called here (ENTER), while the
+                // handle is still valid — at EXIT it has already been freed.
+                // Actual erasure is deferred to OnBufferCompleted so we don't
+                // race with CUPTI activity records that are still in-flight.
+                {
+                    uint32_t retireGraphId = 0;
+                    if (domain == CUPTI_CB_DOMAIN_RUNTIME_API &&
+                        cbid == CUPTI_RUNTIME_TRACE_CBID_cudaGraphExecDestroy_v10000) {
+                        auto* p = (cudaGraphExecDestroy_v10000_params*)apiInfo->functionParams;
+                        CUPTI_API_CALL(cuptiGetGraphExecId((CUgraphExec)p->graphExec, &retireGraphId));
+                    } else if (domain == CUPTI_CB_DOMAIN_DRIVER_API &&
+                               cbid == CUPTI_DRIVER_TRACE_CBID_cuGraphExecDestroy) {
+                        auto* p = (cuGraphExecDestroy_params*)apiInfo->functionParams;
+                        CUPTI_API_CALL(cuptiGetGraphExecId(p->hGraphExec, &retireGraphId));
+                    }
+                    if (retireGraphId != 0) {
+                        auto& state = PersistentState::Get();
+                        std::lock_guard<std::mutex> lock(state.graphRetireMutex);
+                        state.graphExecPendingRetire.insert(retireGraphId);
+                    }
+                }
             }
 
             if (apiInfo->callbackSite == CUPTI_API_EXIT) {
@@ -1307,6 +1382,11 @@ namespace tracy
             ConcurrentHashMap<CorrelationID, APICallInfo> cudaCallSiteInfo;
             ConcurrentHashMap<uint32_t, APICallInfo> cudaGraphCurrentLaunch;
             ConcurrentHashMap<uintptr_t, int> memAllocAddress;
+            // Pending retirement: graphIds whose exec handles have been destroyed.
+            // Entries are erased from cudaGraphCurrentLaunch in OnBufferCompleted
+            // once no further activity records for the exec arrive in a buffer.
+            std::mutex graphRetireMutex;
+            std::unordered_set<uint32_t> graphExecPendingRetire;
             CUpti_SubscriberHandle subscriber = {};
             CUDACtx* profilerHost = nullptr;
 
