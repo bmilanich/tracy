@@ -124,6 +124,9 @@ uint8_t gpu_context_allocate( ToolData* data )
         tracy::MemWrite( &item->gpuContextNameFat.context, context_id );
         tracy::MemWrite( &item->gpuContextNameFat.ptr, (uint64_t)cloned_name );
         tracy::MemWrite( &item->gpuContextNameFat.size, name_length );
+#ifdef TRACY_ON_DEMAND
+        GetProfiler().DeferItem( *item );
+#endif
         tracy::Profiler::QueueSerialFinish();
     }
 

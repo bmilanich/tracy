@@ -5,7 +5,7 @@ HIP application built with `TRACY_ON_DEMAND` and `TRACY_ROCPROF`.
 
 ## Root cause
 
-Two bugs in `TracyRocprof.cpp` break on-demand profiling:
+Three bugs in `TracyRocprof.cpp` break on-demand profiling:
 
 1. **GpuNewContext not deferred.** `gpu_context_allocate()` writes a
    `GpuNewContext` queue item but does not call `DeferItem()`. When a
@@ -15,7 +15,12 @@ Two bugs in `TracyRocprof.cpp` break on-demand profiling:
 
        Assertion `ctx' failed in ProcessGpuZoneBeginImplCommon
 
-2. **Kernel symbols dropped before init.** The `data->init` guard at the
+2. **GpuContextName not deferred.** Same function writes the context
+   name ("rocprofv3") without calling `DeferItem()`. Even after fixing
+   bug 1, a late-connecting client sees the GPU context but it appears
+   unnamed in the profiler. Use `check_gpu_ctx_name` to verify.
+
+3. **Kernel symbols dropped before init.** The `data->init` guard at the
    top of `tool_callback_tracing_callback()` blocks all callbacks before
    the GPU context is allocated. Kernel symbol registrations
    (`CODE_OBJECT_DEVICE_KERNEL_SYMBOL_REGISTER`) happen at HIP init
@@ -36,9 +41,24 @@ make
 tracy-capture -o repro.tracy -s 5
 ```
 
+## Verifying the context name
+
+`check_gpu_ctx_name` loads a `.tracy` file and prints the GPU context
+names. Build it against the Tracy server library (e.g. from a capture
+build directory) and run:
+
+```bash
+./check_gpu_ctx_name repro.tracy
+# Expected (patched):   "GPU context 0: rocprofv3"
+# Expected (unpatched): "GPU context 0: (unnamed)"
+```
+
+Exit codes: 0 = all contexts named, 2 = unnamed context found.
+
 ## What to expect
 
 | Tracy version | Result |
 |---|---|
 | Unpatched | `tracy-capture` crashes: `Assertion 'ctx' failed` |
-| Patched   | Capture succeeds with ~50 GPU zones (`vectorAdd`) with kernel names |
+| Patched (GpuNewContext only) | Capture succeeds but GPU context is unnamed |
+| Fully patched | Capture succeeds with ~50 GPU zones and context named "rocprofv3" |
